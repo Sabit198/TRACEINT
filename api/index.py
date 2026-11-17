@@ -14,11 +14,13 @@ from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters, ChatMemberHandler
+from telegram.request import HTTPXRequest
 
-BOT_TOKEN = "8979718258:AAFvgQIQ8p7MenN5prtZS_-QiOtMbZd2Xdw"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8979718258:AAFvgQIQ8p7MenN5prtZS_-QiOtMbZd2Xdw")
 BOT_USERNAME = "TRACEINT_XBot"
-WEBHOOK_SECRET = "TRACEINT_SECRET_CHANGE_ME"
-API_KEY = "Boss8055"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+API_KEY = os.environ.get("API_KEY", "Boss8055")
 BASE = "https://raxxosint.onrender.com"
 BASE2 = "https://admin.gbssystems.com/gateway/v1"
 
@@ -77,7 +79,6 @@ _dedup_cache = {}
 _rate_cache = {}
 _member_cache = {}
 
-app = FastAPI()
 telegram_app = None
 
 
@@ -169,7 +170,7 @@ def fetch_api(url):
     }
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=25, context=ctx) as resp:
             body = resp.read()
             code = resp.status
             ctype = resp.headers.get("Content-Type", "")
@@ -499,34 +500,48 @@ async def plain_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await run_query(update, context, chat_id, user_id, first_name, username, service, value_text)
 
 
+async def build_app():
+    global telegram_app
+    if telegram_app is not None:
+        return telegram_app
+    request = HTTPXRequest(connect_timeout=10.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=5.0)
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .updater(None)
+        .build()
+    )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_join$"))
+    application.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+    application.add_handler(MessageHandler(filters.COMMAND, command_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text_handler))
+    application.add_error_handler(error_handler)
+    await application.initialize()
+    telegram_app = application
+    return telegram_app
+
+
+app = FastAPI()
+
+
 @app.on_event("startup")
 async def on_startup():
-    global telegram_app
-    telegram_app = Application.builder().token(BOT_TOKEN).updater(None).build()
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify_join$"))
-    telegram_app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
-    telegram_app.add_handler(MessageHandler(filters.COMMAND, command_handler))
-    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text_handler))
-    telegram_app.add_error_handler(error_handler)
-    await telegram_app.initialize()
-    webhook_url = os.environ.get("WEBHOOK_URL", "")
-    if webhook_url:
-        await telegram_app.bot.set_webhook(
-            url=webhook_url,
-            secret_token=WEBHOOK_SECRET,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-        logger.info("Webhook set to %s", webhook_url)
-    await telegram_app.start()
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    if telegram_app:
-        await telegram_app.stop()
-        await telegram_app.shutdown()
+    application = await build_app()
+    if WEBHOOK_URL:
+        try:
+            kwargs = {
+                "url": WEBHOOK_URL,
+                "allowed_updates": Update.ALL_TYPES,
+                "drop_pending_updates": True,
+            }
+            if WEBHOOK_SECRET:
+                kwargs["secret_token"] = WEBHOOK_SECRET
+            await application.bot.set_webhook(**kwargs)
+            logger.info("Webhook set to %s", WEBHOOK_URL)
+        except Exception as e:
+            logger.error("setWebhook failed: %s", e)
 
 
 @app.get("/")
@@ -534,15 +549,25 @@ async def root():
     return {"status": "ok", "bot": BOT_USERNAME}
 
 
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if secret and secret != WEBHOOK_SECRET:
-        return Response(status_code=403)
+    if WEBHOOK_SECRET:
+        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if secret != WEBHOOK_SECRET:
+            return Response(status_code=403)
     try:
         data = await request.json()
     except Exception:
         return Response(status_code=400)
-    update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
+    application = await build_app()
+    update = Update.de_json(data, application.bot)
+    try:
+        await application.process_update(update)
+    except Exception as e:
+        logger.error("process_update failed: %s", e)
     return {"ok": True}
